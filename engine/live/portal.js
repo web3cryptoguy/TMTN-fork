@@ -5,6 +5,7 @@ import { PORTAL, FACTORY, ZERO, BNB_NATIVE } from './config.js';
 import * as baw from './baw.js';
 import { USDT, ONDO_RE, viaUsdt, markViaUsdt, waitReceived } from './quoteRoutes.js';
 import { capFor, capLabel, sendApproval } from './approvals.js';
+import { GangV2 } from './gangV2Pads.js';   // 借它的 swapRoute / swapWait：BNB ↔ 报价币按路线自动跳（Ondo 经 USDT、休市走 PancakeSwap V3）
 
 const PORTAL_ABI = [
   'function buy(address market, uint256 minShares) payable',
@@ -99,6 +100,8 @@ export class Portal {
     throw new Error(`授权 ${sym} 没有在链上生效`);
   }
 
+  router() { return (this.gv ||= new GangV2(this.provider, (o) => this.send(o))); }
+
   async received(qc, wallet, before) {
     let got = 0n;
     for (let i = 0; i < 10; i++) { got = (await qc.balanceOf(wallet)) - before; if (got > 0n) break; await sleep(1000); }
@@ -133,12 +136,9 @@ export class Portal {
       const qty = short.toFixed(18).replace(/\.?0+$/, '');
       if (short < Number(amountBnb)) step(`钱包里有 ${ethers.formatUnits(before, dec)} ${quoteSym}，不够 ${ethers.formatUnits(need, dec)}，用 ${qty} BNB 换差额`, 0);
       const t = Date.now();
-      const sw = await baw.marketSwap({ fromTokenQty: qty, fromToken: BNB_NATIVE, toToken: quoteAddress, slippage });
-      if (!sw.orderId) throw new Error(`BNB→${quoteSym} 兑换没有返回 orderId`);
-      step(`BNB→${quoteSym} 已提交 ${sw.orderId}`, Date.now() - t);
-      const o = await baw.pollOrder(sw.orderId);
-      if (o?.status !== 'FINISHED') throw new Error(`BNB→${quoteSym} 兑换${o?.status === 'FAILED' ? '失败' : '未完成（仍在处理，请在钱包里查看）'}，订单 ${sw.orderId}`);
-      if (o.txHash) hashes.push(o.txHash);
+      // 按路线自动跳：普通报价币直接换；Ondo 类（FXIon / NVDAB …）BNB→USDT→报价币，美股休市时 USDT→报价币 走 PancakeSwap V3
+      const r = await this.router().swapRoute({ wallet, from: BNB_NATIVE, to: quoteAddress, qty, slippage, step, label: `BNB→${quoteSym}` });
+      hashes.push(...r.hashes);
       got = await this.received(qc, wallet, before);
       if (got <= 0n) throw new Error(`BNB→${quoteSym} 已完成，但余额没有增加，停止后续步骤`);
       step(`收到 ${ethers.formatUnits(got, dec)} ${quoteSym}`, Date.now() - t);
@@ -198,9 +198,9 @@ export class Portal {
     for (let k = 0; k < 3; k++) {
       try {
         if (viaUsdt(quoteAddress)) {   // Ondo 类报价币（NVDAB / FXIon …）只能和稳定币直接换：报价币→USDT→BNB；USDT 那步只换一次，重试只重试 USDT→BNB
-          if (usdtGot == null) { const a = await baw.marketSwap({ fromTokenQty: ethers.formatUnits(got, dec), fromToken: quoteAddress, toToken: USDT, slippage }); const oa = a.orderId ? await baw.pollOrder(a.orderId) : null;
-            if (oa && oa.status !== 'FINISHED' && oa.status !== 'FAILED') { o = oa; sw = a; break; }   // 已提交、结果未知：不重试，免得重复卖
-            if (oa?.status !== 'FINISHED') throw new Error(`${quoteSym}→USDT ${oa?.status === 'FAILED' ? '失败' : '未完成'}（订单 ${a.orderId || '无'}）`); if (oa.txHash) hashes.push(oa.txHash); usdtGot = String(oa.toTokenActualQty); step(`${quoteSym}→USDT 完成 ${usdtGot}`, Date.now() - t); }
+          if (usdtGot == null) {   // 报价币→USDT（休市时 swapWait 自动走 PancakeSwap V3）；这一步只做一次，失败或结果未知都不重试，免得重复卖
+            let a; try { a = await this.router().swapWait({ wallet, from: quoteAddress, to: USDT, qty: ethers.formatUnits(got, dec), slippage, step, label: `${quoteSym}→USDT` }); } catch (e) { o = { status: 'FAILED', err: e.message }; break; }
+            if (a.o?.txHash) hashes.push(a.o.txHash); usdtGot = ethers.formatUnits(a.got, 18); step(`${quoteSym}→USDT 完成 ${usdtGot}`, Date.now() - t); }
           sw = await baw.marketSwap({ fromTokenQty: usdtGot, fromToken: USDT, toToken: BNB_NATIVE, slippage });
         } else sw = await baw.marketSwap({ fromTokenQty: ethers.formatUnits(got, dec), fromToken: quoteAddress, toToken: BNB_NATIVE, slippage });
         o = sw.orderId ? await baw.pollOrder(sw.orderId) : null;

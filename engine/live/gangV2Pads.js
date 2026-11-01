@@ -8,6 +8,7 @@ import * as baw from './baw.js';
 import { capFor, capLabel, sendApproval } from './approvals.js';
 import { BNB_NATIVE, KEEP_WBNB_MIN_BNB } from './config.js';
 import { getRoute, setRoute, waitReceived } from './quoteRoutes.js';
+import { CLOSED_RE, v3Quote, v3Swap, units } from './ondoDirect.js';   // Ondo 美股休市：USDT ↔ Ondo 改走 PancakeSwap V3
 import { V3_PADS, isV3Pad, v3PadAbi, normCurve, assertV3Trade, v3Pending } from './gangV3.js';   // Gang V3：曲线公式、buy / sell 和 V2 相同，curves() 多两个字段
 
 // 0x245a…88e4：gang.fun track "stocks" 的又一个 pad（ABI / Buy / Created 事件与 V2 相同，字节码核对过）；接口 /api/tokens 的 v2Launchpad 字段对这些盘写的是 0x1B8F，不可信，以链上 curves() 为准
@@ -98,12 +99,35 @@ export class GangV2 {
   // 一笔 baw 兑换并等到完成；返回到账数量（按链上余额差）
   async swapWait({ wallet, from, to, qty, slippage, step, label }) {
     const t0 = Date.now(), before = to === BNB_NATIVE ? null : await this.balanceOf(to, wallet);
-    const sw = await baw.marketSwap({ fromTokenQty: String(qty), fromToken: from, toToken: to, slippage });
+    let sw;
+    try { sw = await baw.marketSwap({ fromTokenQty: String(qty), fromToken: from, toToken: to, slippage }); }
+    catch (e) {   // Ondo 币美股休市（周末 / 夜里）币安不给换：USDT ↔ Ondo 改走 PancakeSwap V3 上的 USDT 池
+      if (!CLOSED_RE.test(e.message) || ![from, to].some((a) => a.toLowerCase() === USDT.toLowerCase()) || to === BNB_NATIVE || from === BNB_NATIVE) throw e;
+      const amountIn = units(qty, await this.decimals(from));
+      try { return await v3Swap({ g: this, wallet, from, to, amountIn, slippage, step, label }); }
+      catch (e2) { throw new Error(`${e.message}（美股休市；改走 PancakeSwap V3 也不行：${e2.message}）`); }
+    }
     if (!sw.orderId) throw new Error(`${label} 没有返回 orderId`);
     step(`${label} 已提交 ${sw.orderId}`, Date.now() - t0);
     if (before == null) { const o = await baw.pollOrder(sw.orderId); if (o?.status !== 'FINISHED') throw new Error(`${label}${o?.status === 'FAILED' ? '失败' : '未完成'}（订单 ${sw.orderId}），后续步骤没有执行`); return { o, got: null }; }
     const r = await this.waitArrival({ orderId: sw.orderId, token: to, wallet, before, label });
     return { o: r.o, got: r.got };
+  }
+
+  // 一笔「BNB ↔ 报价币」兑换，按路线自动跳：普通报价币直接换；Ondo 类（只能和稳定币直接换）拆成 BNB→USDT→报价币 / 报价币→USDT→BNB；
+  // 每一步都走 swapWait（美股休市时 USDT ↔ Ondo 改走 PancakeSwap V3）。路线表没记录的 Ondo 币，第一次报错时记下并改走 USDT（报错时还没提交订单）。
+  // 返回 { got: 目标币到账（BNB 为 null）, hashes }
+  async swapRoute({ wallet, from, to, qty, slippage, step, label }) {
+    const isBnb = (a) => String(a).toLowerCase() === BNB_NATIVE.toLowerCase(), other = isBnb(from) ? to : from, hashes = [];
+    const one = async (f, t, n, l) => { const r = await this.swapWait({ wallet, from: f, to: t, qty: n, slippage, step, label: l }); if (r.o?.txHash) hashes.push(r.o.txHash); return r.got; };
+    if (!(await this.needsUsdt(other))) {
+      try { return { got: await one(from, to, qty, label), hashes }; }
+      catch (e) { if (!ONDO_RE.test(e.message)) throw e; setRoute(other, { buy: 'via_USDT', sell: 'via_USDT', note: '只能和稳定币直接兑换（Ondo 类）' }); this.viaUsdt?.set(String(other).toLowerCase(), true); step(`${label} 只能和稳定币直接兑换（Ondo 类），改走 USDT 两步`, 0); }
+    }
+    const u = await one(from, USDT, qty, `${label}（第 1 步 →USDT）`);
+    if (!(u > 0n)) throw new Error(`${label} 第 1 步没有拿到 USDT，没有继续`);
+    try { return { got: await one(USDT, to, ethers.formatUnits(u, 18), `${label}（第 2 步 USDT→）`), hashes }; }
+    catch (e) { e.message = `${e.message}；第 1 步已换出 ${ethers.formatUnits(u, 18)} USDT 留在钱包`; throw e; }
   }
 
   // 等兑换到账：链上余额和 baw 订单状态同时看，余额先到就直接往下走。baw 每查一次订单要起一个进程（约 0.5 秒），
@@ -130,7 +154,10 @@ export class GangV2 {
     const dec = await this.decimals(q);
     if (await this.needsUsdt(q)) {
       const u = await baw.marketQuote({ fromTokenQty: String(amountBnb), fromToken: BNB_NATIVE, toToken: USDT });
-      const r = await baw.marketQuote({ fromTokenQty: Number(u?.toCoinAmount || 0).toFixed(6), fromToken: USDT, toToken: q });
+      const uq = Number(u?.toCoinAmount || 0).toFixed(6);
+      // 美股休市时币安 USDT→Ondo 报价直接报错：改用 PancakeSwap V3 USDT 池的链上报价（下单时 swapWait 也会改走这个池子）
+      const r = await baw.marketQuote({ fromTokenQty: uq, fromToken: USDT, toToken: q }).catch(async (e) => { if (!CLOSED_RE.test(e.message)) throw e; return { v3: await v3Quote(this.provider, USDT, q, ethers.parseUnits(uq, 18)).catch((e2) => { throw new Error(`${e.message}（美股休市；PancakeSwap V3 也报不了价：${e2.message}）`); }) }; });
+      if (r?.v3 != null) return r.v3;
       return ethers.parseUnits(Number(r?.toCoinAmount || 0).toFixed(Math.min(12, dec)), dec);
     }
     const r = await baw.marketQuote({ fromTokenQty: String(amountBnb), fromToken: BNB_NATIVE, toToken: q });

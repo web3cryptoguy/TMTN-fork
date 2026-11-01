@@ -14,6 +14,7 @@ import { Portal } from './portal.js';
 import * as openFour from './openFour.js';
 import { GangTrade, GANG_PAD } from './gangTrade.js';
 import { GangV2 } from './gangV2Pads.js';
+import { CLOSED_RE, v3Quote, v3Swap, units } from './ondoDirect.js';   // Ondo 美股休市：USDT ↔ Ondo 改走 PancakeSwap V3
 import { V3_TRADE } from './gangV3.js';
 import { fairBuy, fairSell } from './gangFair.js';
 import { FlapNft, FLAP_PORTAL } from './flapNft.js';
@@ -434,8 +435,8 @@ export class LiveTrader extends EventEmitter {
       } else if (side === 'buy' && t.source === 'agent-curve' && t.market && this.onCurve(t)) {
         // 非 BNB 底池：BNB→报价币用 baw 报价，再用 Portal.quoteBuy 算份额
         const { ethers } = await import('ethers');
-        const sq = await baw.marketQuote({ fromTokenQty: trim(amount), fromToken: BNB_NATIVE, toToken: t.quoteAddress, slippage });
-        const quoteOut = Number(sq?.toCoinAmount || 0);
+        // BNB→报价币 按路线报价：Ondo 类（FXIon …）经 USDT，美股休市时用 PancakeSwap V3 链上报价（gangV2.bnbToQuote）
+        const qDec = await this.gangV2.decimals(t.quoteAddress), quoteOut = Number(ethers.formatUnits(await this.gangV2.bnbToQuote(t.quoteAddress, trim(amount)), qDec));
         const q = await this.portal.quoteBuy(t.market, w.address, ethers.parseUnits(quoteOut.toFixed(12), 18));
         const out = +ethers.formatEther(q.shares);
         v = { ...base, amountIn: +amount, out, minOut: out * (1 - slippage / 100), quoteOut, feeQuote: +ethers.formatEther(q.fee), feePct: quoteOut ? (+ethers.formatEther(q.fee) / quoteOut) * 100 : null };
@@ -691,7 +692,12 @@ export class LiveTrader extends EventEmitter {
     const { balance, symbol } = await this.quoteBal(token); if (!(balance > 0)) throw new Error(`钱包里没有 ${symbol}`);
     if (token.toLowerCase() === QUOTE_TOKENS.WBNB.toLowerCase()) return { token, symbol, balance, out: balance, minOut: balance, route: 'WBNB.withdraw 解包（1:1，只付 gas）', slippage: 0 };
     const two = async () => {   // Ondo 类：报价两步，代币→USDT→BNB
-      const a = await baw.marketQuote({ fromTokenQty: trim(balance), fromToken: token, toToken: USDT, slippage });
+      // 美股休市币安报不了 Ondo→USDT：用 PancakeSwap V3 USDT 池的链上报价（真正换的时候 swapOnce 也会改走这个池子）
+      const a = await baw.marketQuote({ fromTokenQty: trim(balance), fromToken: token, toToken: USDT, slippage }).catch(async (e) => {
+        if (!CLOSED_RE.test(e.message)) throw e;
+        const out = await v3Quote(this.gangV2.provider, token, USDT, units(trim(balance), await this.gangV2.decimals(token)));
+        return { toCoinAmount: ethers.formatUnits(out, 18) };
+      });
       return baw.marketQuote({ fromTokenQty: trim(Number(a?.toCoinAmount || 0)), fromToken: USDT, toToken: BNB_NATIVE, slippage });
     };
     let q, via = viaUsdt(token);
@@ -1082,7 +1088,16 @@ export class LiveTrader extends EventEmitter {
   }
   async swapOnce({ from, to, qty, slippage, step, label }) {
     const t0 = Date.now();
-    const sw = await baw.marketSwap({ fromTokenQty: typeof qty === 'string' ? qty : trim(qty), fromToken: from, toToken: to, slippage });   // 字符串 = 精确数量，原样传
+    let sw;
+    try { sw = await baw.marketSwap({ fromTokenQty: typeof qty === 'string' ? qty : trim(qty), fromToken: from, toToken: to, slippage }); }   // 字符串 = 精确数量，原样传
+    catch (e) {   // Ondo 币美股休市币安不给换：USDT ↔ Ondo 这一步改走 PancakeSwap V3 上的 USDT 池（报错时还没提交订单）
+      const w = this.wallets[0]?.address, isU = (a) => String(a).toLowerCase() === USDT.toLowerCase();
+      if (!CLOSED_RE.test(e.message) || !w || !(isU(from) || isU(to)) || [from, to].some((a) => String(a).toLowerCase() === BNB_NATIVE.toLowerCase())) throw e;
+      const g = this.gangV2, amountIn = units(typeof qty === 'string' ? qty : trim(qty), await g.decimals(from));
+      let r; try { r = await v3Swap({ g, wallet: w, from, to, amountIn, slippage, step, label }); } catch (e2) { throw new Error(`${e.message}（美股休市；改走 PancakeSwap V3 也不行：${e2.message}）`); }
+      const raw = ethers.formatUnits(r.got, await g.decimals(to));
+      return { venue: 'PancakeSwap V3（美股休市）', expected: Number(raw), raw, txHash: r.o.txHash, hashes: r.hashes, note: null };
+    }
     if (!sw.orderId) throw new Error(`${label} 没有返回 orderId`);
     step(`${label} 已提交 ${sw.orderId}`, Date.now() - t0);
     const o = await baw.pollOrder(sw.orderId);
